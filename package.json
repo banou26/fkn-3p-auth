@@ -1,0 +1,65 @@
+{
+  "name": "@banou/fkn-3p-auth",
+  "version": "0.1.0",
+  "description": "Shared third-party window auth, cloud sign-out, hidden session probes, cross-tab sync, and Google sign-in helpers on @fkn/lib.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "main": "./build/index.js",
+  "types": "./build/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./build/index.d.ts",
+      "import": "./build/index.js"
+    },
+    "./google": {
+      "types": "./build/google.d.ts",
+      "import": "./build/google.js"
+    }
+  },
+  "files": [
+    "build",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "vp build && tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "lint": "vp check --no-fmt",
+    "test": "vp test run"
+  },
+  "peerDependencies": {
+    "@fkn/lib": ">=0.9.86"
+  },
+  "peerDependenciesMeta": {
+    "@fkn/lib": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@fkn/lib": "^0.9.87",
+    "@types/node": "^25.9.5",
+    "typescript": "^7.0.2",
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.3",
+    "vite-plus": "0.3.3",
+    "vitest": "4.1.11"
+  },
+  "overrides": {
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.3",
+    "vitest": "4.1.11"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/banou26/fkn-3p-auth.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "fkn",
+    "auth",
+    "oauth",
+    "google"
+  ]
+}
