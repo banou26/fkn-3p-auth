@@ -112,4 +112,47 @@ describe('verifyHiddenSession', () => {
     ).rejects.toThrow(TypeError)
     expect(mount).not.toHaveBeenCalled()
   })
+  it('removes the iframe and rejects when the probe or settle stalls past the deadline or the signal aborts', async () => {
+    const mount = () => {
+      const remove = vi.fn()
+      return { remove, mountHiddenFrame: () => ({ iframe: {} as HTMLIFrameElement, remove }) }
+    }
+    const client = { attachFrame: vi.fn(async () => ({}) as Frame) } as unknown as FknClient
+
+    const stalledProbe = mount()
+    const probeError = await verifyHiddenSession({
+      client,
+      url: 'https://www.crunchyroll.com/',
+      mountHiddenFrame: stalledProbe.mountHiddenFrame,
+      timeoutMs: 20,
+      probe: () => new Promise<boolean>(() => {}),
+    }).catch((error: unknown) => error)
+    expect((probeError as Error).name).toBe('TimeoutError')
+    expect(stalledProbe.remove).toHaveBeenCalledTimes(1)
+
+    const stalledSettle = mount()
+    const controller = new AbortController()
+    const run = verifyHiddenSession({
+      client,
+      url: 'https://www.crunchyroll.com/',
+      mountHiddenFrame: stalledSettle.mountHiddenFrame,
+      signal: controller.signal,
+      probe: async () => true,
+      settle: () => new Promise<void>(() => {}),
+    })
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    controller.abort(new Error('page left'))
+    await expect(run).rejects.toThrow('page left')
+    expect(stalledSettle.remove).toHaveBeenCalledTimes(1)
+
+    const aborted = mount()
+    await expect(verifyHiddenSession({
+      client,
+      url: 'https://www.crunchyroll.com/',
+      mountHiddenFrame: aborted.mountHiddenFrame,
+      signal: AbortSignal.abort(new Error('already gone')),
+      probe: async () => true,
+    })).rejects.toThrow('already gone')
+    expect(aborted.remove).not.toHaveBeenCalled()
+  })
 })
