@@ -1,5 +1,6 @@
 import type { WindowFrame } from '@fkn/lib'
 
+import { isLocatorInvalid, isPermissionDenied } from '@fkn/lib'
 import { describe, expect, it, vi } from 'vite-plus/test'
 
 import { openAuthWindow, type FknClient } from '../src'
@@ -10,6 +11,9 @@ import {
   GOOGLE_PASSKEY_SELECTORS,
   youtubeAuthAdapter,
 } from '../src/google'
+
+const clientWith = (attachFrame: unknown): FknClient =>
+  ({ attachFrame, isLocatorInvalid, isPermissionDenied }) as unknown as FknClient
 
 type FakePageState = {
   visible: Set<string>
@@ -61,6 +65,7 @@ const fakeGoogleWindow = (backend: 'cloud' | 'extension' = 'cloud') => {
 
   return {
     frame,
+    goto,
     page,
     clicks,
     styles,
@@ -86,7 +91,7 @@ describe('Google auth adapter', () => {
       },
     }
 
-    const run = openAuthWindow(adapter, { client: { attachFrame } as unknown as FknClient })
+    const run = openAuthWindow(adapter, { client: clientWith(attachFrame) })
 
     expect(attachFrame).toHaveBeenCalledWith({
       window: {},
@@ -136,22 +141,22 @@ describe('Google auth adapter', () => {
     const win = fakeGoogleWindow('cloud')
     let clock = 1_000
     const run = openAuthWindow(adapter, {
-      client: { attachFrame: vi.fn(async () => win.frame) } as unknown as FknClient,
+      client: clientWith(vi.fn(async () => win.frame)),
       now: () => clock,
     })
 
-    // Wait for prepare() severity-0 style injection and ServiceLogin click.
-    await vi.waitFor(() => expect(win.addStyleTag).toHaveBeenCalledTimes(1))
-    expect(win.addStyleTag).toHaveBeenCalledWith({ content: passkeyCss })
+    // ServiceLogin is clicked on the entry page; the passkey CSS waits for an accounts.google.com document.
     await vi.waitFor(() => expect(win.clicks).toHaveLength(1))
+    expect(win.addStyleTag).not.toHaveBeenCalled()
 
-    // Arrival on /challenge/selection re-applies CSS via onDocument; selectionList must block Try another way click.
+    // Arrival on /challenge/selection applies CSS via onDocument; selectionList must block Try another way click.
     win.page.visible.clear()
     win.page.visible.add('.passkey-prompt')
     win.page.visible.add('.challenge-selection')
     win.page.visible.add('button.try-another')
     win.emitDocument('https://accounts.google.com')
-    await vi.waitFor(() => expect(win.addStyleTag).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(win.addStyleTag).toHaveBeenCalledTimes(1))
+    expect(win.addStyleTag).toHaveBeenCalledWith({ content: passkeyCss })
     await new Promise((resolve) => setTimeout(resolve, 15))
     expect(win.clicks).toHaveLength(1)
 
@@ -177,7 +182,7 @@ describe('Google auth adapter', () => {
     win2.page.visible.add('.passkey-prompt')
     win2.page.visible.add('button.try-another')
     const run2 = openAuthWindow(adapter, {
-      client: { attachFrame: vi.fn(async () => win2.frame) } as unknown as FknClient,
+      client: clientWith(vi.fn(async () => win2.frame)),
       now: () => 5_000,
     })
     await vi.waitFor(() => expect(win2.clicks).toHaveLength(1))
@@ -205,7 +210,7 @@ describe('Google auth adapter', () => {
       selectors,
     })
     const extRun = openAuthWindow(cloudOnlyAdapter, {
-      client: { attachFrame: vi.fn(async () => extWin.frame) } as unknown as FknClient,
+      client: clientWith(vi.fn(async () => extWin.frame)),
     })
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(extWin.addStyleTag).not.toHaveBeenCalled()
@@ -224,12 +229,35 @@ describe('Google auth adapter', () => {
       selectors,
     })
     const alwaysRun = openAuthWindow(alwaysAdapter, {
-      client: { attachFrame: vi.fn(async () => alwaysWin.frame) } as unknown as FknClient,
+      client: clientWith(vi.fn(async () => alwaysWin.frame)),
     })
-    await vi.waitFor(() => expect(alwaysWin.addStyleTag).toHaveBeenCalledTimes(1))
     await vi.waitFor(() => expect(alwaysWin.clicks).toHaveLength(1))
+    // the extension reports no origin, so its documents arrive with ''
+    alwaysWin.emitDocument('')
+    await vi.waitFor(() => expect(alwaysWin.addStyleTag).toHaveBeenCalledTimes(1))
     alwaysWin.page.avatarCount = 1
     expect(await alwaysRun).toEqual({ status: 'authed', backend: 'extension' })
+  })
+
+  it('clicks ServiceLogin only on the entry origin and applies passkey CSS only on accounts.google.com', async () => {
+    const passkeyCss = '.passkey-choice { display: none; }'
+    const adapter = youtubeAuthAdapter({ pollMs: 1, selectors: { passkeyChoiceCss: passkeyCss } })
+
+    const onAccounts = fakeGoogleWindow('cloud')
+    // the entry page redirects straight to accounts.google.com, as for a signed-out session
+    onAccounts.goto.mockImplementation(async () => {
+      onAccounts.emitDocument('https://accounts.google.com')
+    })
+    const run = openAuthWindow(adapter, { client: clientWith(vi.fn(async () => onAccounts.frame)) })
+    await vi.waitFor(() => expect(onAccounts.addStyleTag).toHaveBeenCalledTimes(1))
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(onAccounts.clicks).toHaveLength(0)
+
+    onAccounts.emitDocument('https://www.youtube.com')
+    await vi.waitFor(() => expect(onAccounts.clicks).toHaveLength(1))
+    expect(onAccounts.addStyleTag).toHaveBeenCalledTimes(1)
+    onAccounts.page.avatarCount = 1
+    expect(await run).toEqual({ status: 'authed', backend: 'cloud' })
   })
 
   it('does not click Try another way when selectionList selector is omitted', async () => {
@@ -246,7 +274,7 @@ describe('Google auth adapter', () => {
       },
     })
     const run = openAuthWindow(partialAdapter, {
-      client: { attachFrame: vi.fn(async () => win.frame) } as unknown as FknClient,
+      client: clientWith(vi.fn(async () => win.frame)),
     })
 
     await new Promise((resolve) => setTimeout(resolve, 20))

@@ -1,6 +1,5 @@
 import type {
   AttachCookies,
-  attachFrame,
   CategoryRequest,
   Frame,
   FrameWindowRefusal,
@@ -13,11 +12,8 @@ export type AuthBackend = 'cloud' | 'extension'
 /** Cloud-backed cookie jar modes supported by `attachFrame`. */
 export type CloudCookies = 'persistent' | 'ephemeral'
 
-/** Minimal `@fkn/lib` client interface accepted synchronously by auth helpers. */
-export type FknClient = {
-  attachFrame: typeof attachFrame
-  isTerminalError?: (error: unknown) => boolean
-}
+/** The `@fkn/lib` members auth helpers call, passed in so the package never imports `@fkn/lib` at runtime. */
+export type FknClient = Pick<typeof import('@fkn/lib'), 'attachFrame' | 'isLocatorInvalid' | 'isPermissionDenied'>
 
 /** Static client object or synchronous getter returning the client once loaded. */
 export type ClientSource = FknClient | (() => FknClient | undefined)
@@ -37,6 +33,7 @@ export type AuthOutcome<TSession = void> =
   | { status: 'closed', backend?: AuthBackend }
   | { status: 'blocked' }
   | { status: 'not-ready' }
+  | { status: 'failed', backend?: AuthBackend, error: unknown }
   | {
       status: 'unsupported'
       reason: 'extension-unsupported' | 'refused'
@@ -49,6 +46,8 @@ export type AuthStepContext = {
   frame: WindowFrame
   backend: AuthBackend | undefined
   cookies: AttachCookies
+  /** Origin of the window's current document from its latest `document` event; `''` until one arrives, and always on the extension, which does not report it. */
+  origin: string
   signal: AbortSignal
   once: (stepKey: string, action: () => Promise<void>) => Promise<boolean>
   cooldown: (stepKey: string, cooldownMs: number, action: () => Promise<void>) => Promise<boolean>

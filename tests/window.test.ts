@@ -1,8 +1,26 @@
 import type { AttachCookies, CategoryRequest, WindowFrame } from '@fkn/lib'
 
+import {
+  ExtensionOperationUnsupportedError,
+  ExtensionOutdatedError,
+  FrameWindowBlockedError,
+  FrameWindowRefusedError,
+  isLocatorInvalid,
+  isPermissionDenied,
+  LOCATOR_DENIED,
+  LOCATOR_INVALID,
+  LOCATOR_UNSUPPORTED,
+  PERMISSION_DENIED,
+} from '@fkn/lib'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 
 import { openAuthWindow, type AuthAdapter, type AuthStepContext, type FknClient } from '../src'
+
+const clientWith = (attachFrame: unknown): FknClient =>
+  ({ attachFrame, isLocatorInvalid, isPermissionDenied }) as unknown as FknClient
+
+// @fkn/lib's locator and consent errors are plain Errors told apart by name, which is all its guards read
+const libError = (name: string, message = name) => Object.assign(new Error(message), { name })
 
 type FakeWindowControl = {
   frame: WindowFrame
@@ -89,9 +107,6 @@ const fakeWindow = ({
   }
 }
 
-const namedError = (name: string, extra?: Record<string, unknown>) =>
-  Object.assign(new Error(name), { name, ...extra })
-
 const baseAdapter = <TSession = void>(
   overrides: Partial<AuthAdapter<TSession>> = {},
 ): AuthAdapter<TSession> => ({
@@ -116,7 +131,7 @@ describe('openAuthWindow', () => {
 
   it('calls attachFrame synchronously before returning or awaiting anything', () => {
     const attachFrame = vi.fn(() => new Promise<WindowFrame>(() => {}))
-    const client = { attachFrame } as unknown as FknClient
+    const client = clientWith(attachFrame)
 
     void openAuthWindow(baseAdapter({ domains: ['www.youtube.com', 'accounts.google.com'] }), { client })
 
@@ -145,7 +160,7 @@ describe('openAuthWindow', () => {
     controller.abort()
 
     const outcome = await openAuthWindow(baseAdapter(), {
-      client: { attachFrame } as unknown as FknClient,
+      client: clientWith(attachFrame),
       signal: controller.signal,
     })
 
@@ -155,7 +170,7 @@ describe('openAuthWindow', () => {
 
   it('forwards partial window dimensions and rejects permission reasons over 100 chars up front', async () => {
     const attachFrame = vi.fn(() => new Promise<WindowFrame>(() => {}))
-    const client = { attachFrame } as unknown as FknClient
+    const client = clientWith(attachFrame)
 
     void openAuthWindow(baseAdapter({ window: { width: 1080 } }), { client })
     expect(attachFrame).toHaveBeenLastCalledWith({
@@ -169,16 +184,12 @@ describe('openAuthWindow', () => {
     expect(attachFrame).toHaveBeenCalledTimes(1)
   })
 
-  it('maps blocked, refused, extension-unsupported, and terminal attach errors', async () => {
-    const isTerminalError = (err: unknown) => (err as Error).message.includes('terminal detach')
-    const mkClient = (err: Error) => ({
-      attachFrame: vi.fn(async () => { throw err }),
-      isTerminalError,
-    }) as unknown as FknClient
+  it('maps attach errors, and reports terminal locator errors as failed rather than closed', async () => {
+    const mkClient = (err: Error) => clientWith(vi.fn(async () => { throw err }))
 
-    expect(await openAuthWindow(baseAdapter(), { client: mkClient(namedError('FrameWindowBlockedError')) })).toEqual({ status: 'blocked' })
+    expect(await openAuthWindow(baseAdapter(), { client: mkClient(new FrameWindowBlockedError()) })).toEqual({ status: 'blocked' })
 
-    const refusedKnown = namedError('FrameWindowRefusedError', { reason: 'jar-unreachable' })
+    const refusedKnown = new FrameWindowRefusedError('jar-unreachable')
     expect(await openAuthWindow(baseAdapter(), { client: mkClient(refusedKnown) })).toEqual({
       status: 'unsupported',
       reason: 'refused',
@@ -186,7 +197,7 @@ describe('openAuthWindow', () => {
       error: refusedKnown,
     })
 
-    const refusedUnknown = namedError('FrameWindowRefusedError', { reason: 'future-code' })
+    const refusedUnknown = new FrameWindowRefusedError('future-code')
     expect(await openAuthWindow(baseAdapter(), { client: mkClient(refusedUnknown) })).toEqual({
       status: 'unsupported',
       reason: 'refused',
@@ -194,32 +205,132 @@ describe('openAuthWindow', () => {
       error: refusedUnknown,
     })
 
-    const unsupported = namedError('ExtensionOperationUnsupportedError', { operation: 'attachWindow' })
+    const unsupported = new ExtensionOperationUnsupportedError('attachWindow', 4)
     expect(await openAuthWindow(baseAdapter(), { client: mkClient(unsupported) })).toEqual({
       status: 'unsupported',
       reason: 'extension-unsupported',
       error: unsupported,
     })
 
-    const outdated = namedError('ExtensionOutdatedError')
+    const outdated = new ExtensionOutdatedError(3, 5)
     expect(await openAuthWindow(baseAdapter(), { client: mkClient(outdated) })).toEqual({
       status: 'unsupported',
       reason: 'extension-unsupported',
       error: outdated,
     })
 
-    expect(await openAuthWindow(baseAdapter(), { client: mkClient(new Error('terminal detach')) })).toEqual({
-      status: 'closed',
-    })
+    for (const name of [LOCATOR_DENIED, LOCATOR_UNSUPPORTED, LOCATOR_INVALID, PERMISSION_DENIED]) {
+      const error = libError(name)
+      expect(await openAuthWindow(baseAdapter(), { client: mkClient(error) })).toEqual({ status: 'failed', error })
+    }
 
-    await expect(openAuthWindow(baseAdapter(), { client: mkClient(new Error('unexpected failure')) })).rejects.toThrow('unexpected failure')
+    const unexpected = new Error('unexpected failure')
+    expect(await openAuthWindow(baseAdapter(), { client: mkClient(unexpected) })).toEqual({ status: 'failed', error: unexpected })
+  })
+
+  it('reports a goto a gate refused as failed while the window is still open', async () => {
+    const denied = libError(LOCATOR_DENIED, 'goto: this host is not allowed')
+    const win = fakeWindow({ gotoImpl: async () => { throw denied } })
+    expect(await openAuthWindow(baseAdapter(), { client: clientWith(vi.fn(async () => win.frame)) })).toEqual({
+      status: 'failed',
+      backend: 'cloud',
+      error: denied,
+    })
+    expect(win.close).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports a failed or stalled extractSession as failed, never authed', async () => {
+    const extractError = new Error('token missing')
+    const rejecting = fakeWindow()
+    expect(await openAuthWindow(
+      baseAdapter<string>({ isSignedIn: async () => true, extractSession: async () => { throw extractError } }),
+      { client: clientWith(vi.fn(async () => rejecting.frame)) },
+    )).toEqual({ status: 'failed', backend: 'cloud', error: extractError })
+    expect(rejecting.close).toHaveBeenCalledTimes(1)
+
+    const stalled = fakeWindow()
+    const outcome = await openAuthWindow(
+      baseAdapter<string>({ readTimeoutMs: 20, isSignedIn: async () => true, extractSession: () => new Promise<string>(() => {}) }),
+      { client: clientWith(vi.fn(async () => stalled.frame)) },
+    )
+    expect(outcome.status).toBe('failed')
+    expect((outcome as { error: Error }).error.name).toBe('TimeoutError')
+    expect(stalled.close).toHaveBeenCalledTimes(1)
+  })
+
+  it('latches once only after its action succeeds', async () => {
+    const win = fakeWindow()
+    let attempts = 0
+    let ticks = 0
+    const outcome = await openAuthWindow(
+      baseAdapter({
+        onTick: async (ctx) => {
+          ticks += 1
+          await ctx.once('click', async () => {
+            attempts += 1
+            if (attempts === 1) throw new Error('element detached')
+          })
+        },
+        isSignedIn: async () => ticks >= 4,
+      }),
+      { client: clientWith(vi.fn(async () => win.frame)) },
+    )
+    expect(outcome).toEqual({ status: 'authed', backend: 'cloud' })
+    expect(attempts).toBe(2)
+  })
+
+  it('ends as failed on a step error that cannot recover, and keeps polling through one that can', async () => {
+    const refusal = libError(PERMISSION_DENIED, 'Permission denied: interaction on example.test')
+    const refused = fakeWindow()
+    expect(await openAuthWindow(
+      baseAdapter({ isSignedIn: async () => { throw refusal } }),
+      { client: clientWith(vi.fn(async () => refused.frame)) },
+    )).toEqual({ status: 'failed', backend: 'cloud', error: refusal })
+
+    const invalid = libError(LOCATOR_INVALID, 'click: selector must be a string')
+    const broken = fakeWindow()
+    expect(await openAuthWindow(
+      baseAdapter({ onTick: async () => { throw invalid } }),
+      { client: clientWith(vi.fn(async () => broken.frame)) },
+    )).toEqual({ status: 'failed', backend: 'cloud', error: invalid })
+
+    let reads = 0
+    const offHost = fakeWindow()
+    expect(await openAuthWindow(
+      baseAdapter({
+        isSignedIn: async () => {
+          reads += 1
+          if (reads < 3) throw libError(LOCATOR_DENIED, 'count: the window is on a host outside domains')
+          return true
+        },
+      }),
+      { client: clientWith(vi.fn(async () => offHost.frame)) },
+    )).toEqual({ status: 'authed', backend: 'cloud' })
+  })
+
+  it('passes the latest document origin to each step', async () => {
+    const win = fakeWindow()
+    const seen: string[] = []
+    let ticks = 0
+    await openAuthWindow(
+      baseAdapter({
+        onTick: async (ctx) => {
+          ticks += 1
+          seen.push(ctx.origin)
+          if (ticks === 1) win.emitDocument('https://accounts.google.com')
+        },
+        isSignedIn: async () => ticks >= 2,
+      }),
+      { client: clientWith(vi.fn(async () => win.frame)) },
+    )
+    expect(seen).toEqual(['', 'https://accounts.google.com'])
   })
 
   it('falls back in the same click from native to fallbackCookies only on attachWindow refusal', async () => {
     const win = fakeWindow({ backend: 'cloud' })
     const attachFrame = vi.fn(async (opts: { cookies?: AttachCookies }) => {
       if (opts.cookies === 'native') {
-        throw namedError('ExtensionOperationUnsupportedError', { operation: 'attachWindow' })
+        throw new ExtensionOperationUnsupportedError('attachWindow', 4)
       }
       return win.frame
     })
@@ -235,7 +346,7 @@ describe('openAuthWindow', () => {
         },
         isSignedIn: async () => true,
       }),
-      { client: { attachFrame } as unknown as FknClient },
+      { client: clientWith(attachFrame) },
     )
 
     expect(outcome).toEqual({ status: 'authed', backend: 'cloud' })
@@ -244,36 +355,37 @@ describe('openAuthWindow', () => {
 
     // No cross-jar fallback when fallbackCookies is omitted.
     const noFallbackAttach = vi.fn(async () => {
-      throw namedError('ExtensionOperationUnsupportedError', { operation: 'attachWindow' })
+      throw new ExtensionOperationUnsupportedError('attachWindow', 4)
     })
     const noFallbackOutcome = await openAuthWindow(
       baseAdapter({ cookies: 'native' }),
-      { client: { attachFrame: noFallbackAttach } as unknown as FknClient },
+      { client: clientWith(noFallbackAttach) },
     )
     expect(noFallbackOutcome.status).toBe('unsupported')
     expect(noFallbackAttach).toHaveBeenCalledTimes(1)
 
     // Non-attachWindow operation refusal does not trigger fallbackCookies.
     const otherOpAttach = vi.fn(async () => {
-      throw namedError('ExtensionOperationUnsupportedError', { operation: 'cookies' })
+      throw new ExtensionOperationUnsupportedError('cookies', 4)
     })
     const otherOpOutcome = await openAuthWindow(
       baseAdapter({ cookies: 'native', fallbackCookies: 'persistent' }),
-      { client: { attachFrame: otherOpAttach } as unknown as FknClient },
+      { client: clientWith(otherOpAttach) },
     )
     expect(otherOpOutcome.status).toBe('unsupported')
     expect(otherOpAttach).toHaveBeenCalledTimes(1)
   })
 
-  it('navigates at commit, closes and rethrows non-terminal goto failures, and awaits close() commit before authed', async () => {
+  it('navigates at commit, closes and reports goto failures as failed, and awaits close() commit before authed', async () => {
+    const navigationError = new Error('navigation failed')
     const failing = fakeWindow({
-      gotoImpl: async () => { throw new Error('navigation failed') },
+      gotoImpl: async () => { throw navigationError },
     })
-    await expect(
-      openAuthWindow(baseAdapter(), {
-        client: { attachFrame: vi.fn(async () => failing.frame) } as unknown as FknClient,
+    expect(
+      await openAuthWindow(baseAdapter(), {
+        client: clientWith(vi.fn(async () => failing.frame)),
       }),
-    ).rejects.toThrow('navigation failed')
+    ).toEqual({ status: 'failed', backend: 'cloud', error: navigationError })
     expect(failing.close).toHaveBeenCalledTimes(1)
 
     let polls = 0
@@ -291,7 +403,7 @@ describe('openAuthWindow', () => {
           return { tokenPresent: true }
         },
       }),
-      { client: { attachFrame: vi.fn(async () => slowClose.frame) } as unknown as FknClient },
+      { client: clientWith(vi.fn(async () => slowClose.frame)) },
     )
 
     expect(slowClose.goto).toHaveBeenCalledWith('https://example.test/login', { waitUntil: 'commit', timeout: 12_000 })
@@ -308,7 +420,7 @@ describe('openAuthWindow', () => {
         readTimeoutMs: 20,
         isSignedIn: () => neverEndingRead,
       }),
-      { client: { attachFrame: vi.fn(async () => win.frame) } as unknown as FknClient },
+      { client: clientWith(vi.fn(async () => win.frame)) },
     )
 
     await new Promise((resolve) => setTimeout(resolve, 10))
@@ -320,7 +432,7 @@ describe('openAuthWindow', () => {
     const abortedPromise = openAuthWindow(
       baseAdapter({ pollMs: 50 }),
       {
-        client: { attachFrame: vi.fn(async () => win2.frame) } as unknown as FknClient,
+        client: clientWith(vi.fn(async () => win2.frame)),
         signal: controller.signal,
       },
     )
@@ -373,7 +485,7 @@ describe('openAuthWindow', () => {
         isSignedIn: async () => ticks >= 4,
       }),
       {
-        client: { attachFrame: vi.fn(async () => win.frame) } as unknown as FknClient,
+        client: clientWith(vi.fn(async () => win.frame)),
         now: () => clock,
       },
     )
@@ -395,7 +507,7 @@ describe('openAuthWindow', () => {
         readTimeoutMs: 4_000,
         isSignedIn: () => new Promise<boolean>(() => {}),
       }),
-      { client: { attachFrame: vi.fn(async () => win.frame) } as unknown as FknClient },
+      { client: clientWith(vi.fn(async () => win.frame)) },
     )
 
     await vi.advanceTimersByTimeAsync(15)
@@ -406,7 +518,7 @@ describe('openAuthWindow', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 
-  it('returns closed when goto rejects right as frame.closed settles without isTerminalError and cleans up if onOpen throws', async () => {
+  it('returns closed when goto rejects right as frame.closed settles, and reports a throwing onOpen as failed', async () => {
     const closingWin = fakeWindow({
       gotoImpl: async () => {
         queueMicrotask(() => closingWin.end())
@@ -415,20 +527,21 @@ describe('openAuthWindow', () => {
     })
     expect(
       await openAuthWindow(baseAdapter(), {
-        client: { attachFrame: vi.fn(async () => closingWin.frame) } as unknown as FknClient,
+        client: clientWith(vi.fn(async () => closingWin.frame)),
       }),
     ).toEqual({ status: 'closed', backend: 'cloud' })
     expect(closingWin.close).not.toHaveBeenCalled()
 
     const onOpenWin = fakeWindow()
-    await expect(
-      openAuthWindow(baseAdapter(), {
-        client: { attachFrame: vi.fn(async () => onOpenWin.frame) } as unknown as FknClient,
+    const onOpenError = new Error('onOpen blew up')
+    expect(
+      await openAuthWindow(baseAdapter(), {
+        client: clientWith(vi.fn(async () => onOpenWin.frame)),
         onOpen: () => {
-          throw new Error('onOpen blew up')
+          throw onOpenError
         },
       }),
-    ).rejects.toThrow('onOpen blew up')
+    ).toEqual({ status: 'failed', backend: 'cloud', error: onOpenError })
     expect(onOpenWin.close).toHaveBeenCalledTimes(1)
   })
 })

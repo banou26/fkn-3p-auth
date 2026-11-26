@@ -1,7 +1,5 @@
 import type { CategoryRequest, FrameWindowRefusal } from '@fkn/lib'
 
-import type { FknClient } from './types.js'
-
 /** Maximum character length enforced by `@fkn/lib` on permission reasons. */
 export const MAX_PERMISSION_REASON_LENGTH = 100
 
@@ -45,9 +43,8 @@ export const isExtensionUnsupportedError = (error: unknown): boolean => {
 export const isAttachWindowUnsupportedError = (error: unknown): boolean =>
   errorName(error) === 'ExtensionOperationUnsupportedError' && errorField(error, 'operation') === 'attachWindow'
 
-/** Whether an error indicates the attached frame or window already terminated. */
-export const isTerminalDetachError = (error: unknown, client?: Pick<FknClient, 'isTerminalError'>): boolean =>
-  client?.isTerminalError?.(error) ?? false
+/** A deadline error named `'TimeoutError'`, like `@fkn/lib`'s own, so a check by name matches both. */
+export const timeoutError = (message: string): Error => Object.assign(new Error(message), { name: 'TimeoutError' })
 
 /** Validates up front that no permission reason exceeds `@fkn/lib`'s 100-character limit. */
 export const assertPermissionReasons = (permissions: readonly CategoryRequest[] | undefined): void => {

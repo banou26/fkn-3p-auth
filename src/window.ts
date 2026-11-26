@@ -7,7 +7,7 @@ import {
   isExtensionUnsupportedError,
   isFrameWindowBlockedError,
   isFrameWindowRefusedError,
-  isTerminalDetachError,
+  timeoutError,
 } from './errors.js'
 import {
   resolveClient,
@@ -65,7 +65,7 @@ const buildAttachOptions = (
   }
 }
 
-const classifyAttachError = <TSession>(error: unknown, client: FknClient): AuthOutcome<TSession> => {
+const classifyAttachError = <TSession>(error: unknown): AuthOutcome<TSession> => {
   if (isFrameWindowBlockedError(error)) return { status: 'blocked' }
   if (isExtensionUnsupportedError(error)) {
     return { status: 'unsupported', reason: 'extension-unsupported', error }
@@ -73,8 +73,7 @@ const classifyAttachError = <TSession>(error: unknown, client: FknClient): AuthO
   if (isFrameWindowRefusedError(error)) {
     return { status: 'unsupported', reason: 'refused', refusalReason: frameWindowRefusalOf(error), error }
   }
-  if (isTerminalDetachError(error, client)) return { status: 'closed' }
-  throw error
+  return { status: 'failed', error }
 }
 
 const sleepAbortable = (ms: number, signal: AbortSignal): Promise<void> =>
@@ -94,21 +93,21 @@ const sleepAbortable = (ms: number, signal: AbortSignal): Promise<void> =>
     signal.addEventListener('abort', onAbort, { once: true })
   })
 
-const bounded = <T>(ms: number, signal: AbortSignal, read: () => Promise<T>): Promise<T | undefined> => {
-  if (signal.aborted) return Promise.resolve(undefined)
+type Settled<T> = { ok: true, value: T } | { ok: false, error: unknown }
+
+// Settles with the step's own result or error, a timeout error past `ms`, or the abort reason.
+const bounded = <T>(ms: number, signal: AbortSignal, step: string, read: () => Promise<T>): Promise<Settled<T>> => {
+  if (signal.aborted) return Promise.resolve({ ok: false, error: signal.reason })
   let timer: ReturnType<typeof setTimeout> | undefined
   let onAbort: (() => void) | undefined
   return Promise.race([
-    Promise.resolve().then(read).catch(() => undefined),
-    new Promise<undefined>((resolve) => {
-      onAbort = () => {
-        clearTimeout(timer)
-        resolve(undefined)
-      }
-      timer = setTimeout(() => {
-        if (onAbort) signal.removeEventListener('abort', onAbort)
-        resolve(undefined)
-      }, ms)
+    Promise.resolve().then(read).then(
+      (value): Settled<T> => ({ ok: true, value }),
+      (error: unknown): Settled<T> => ({ ok: false, error }),
+    ),
+    new Promise<Settled<T>>((resolve) => {
+      onAbort = () => resolve({ ok: false, error: signal.reason })
+      timer = setTimeout(() => resolve({ ok: false, error: timeoutError(`openAuthWindow: ${step} did not settle within ${ms}ms`) }), ms)
       signal.addEventListener('abort', onAbort, { once: true })
     }),
   ]).finally(() => {
@@ -135,10 +134,10 @@ const runAttachedWindow = async <TSession>(
       try {
         frame = await client.attachFrame(buildAttachOptions(adapter, fallbackCookies))
       } catch (fallbackError) {
-        return classifyAttachError(fallbackError, client)
+        return classifyAttachError(fallbackError)
       }
     } else {
-      return classifyAttachError(error, client)
+      return classifyAttachError(error)
     }
   }
 
@@ -172,15 +171,22 @@ const runAttachedWindow = async <TSession>(
 
   const now = options.now ?? Date.now
   const onceKeys = new Set<string>()
+  const onceInFlight = new Set<string>()
   const cooldownAt = new Map<string, number>()
   const cooldownInFlight = new Set<string>()
+  let origin = ''
 
   const createStepHelpers = (signal: AbortSignal) => ({
     once: async (stepKey: string, action: () => Promise<void>): Promise<boolean> => {
-      if (signal.aborted || onceKeys.has(stepKey)) return false
-      onceKeys.add(stepKey)
-      await action()
-      return true
+      if (signal.aborted || onceKeys.has(stepKey) || onceInFlight.has(stepKey)) return false
+      onceInFlight.add(stepKey)
+      try {
+        await action()
+        onceKeys.add(stepKey)
+        return true
+      } finally {
+        onceInFlight.delete(stepKey)
+      }
     },
     cooldown: async (stepKey: string, cooldownMs: number, action: () => Promise<void>): Promise<boolean> => {
       if (signal.aborted || cooldownInFlight.has(stepKey)) return false
@@ -204,45 +210,55 @@ const runAttachedWindow = async <TSession>(
       frame,
       backend,
       cookies: activeCookies,
+      origin,
       signal,
       ...helpers,
     }
   }
 
+  const failed = async (error: unknown): Promise<AuthOutcome<TSession>> => {
+    await frame.close().catch(() => {})
+    return { status: 'failed', ...outcomeTag, error }
+  }
+
+  // A refused consent or a malformed step never succeeds on a later tick; anything else (a read on a host
+  // outside `domains`, a timeout, a page mid-navigation) may.
+  const isFatalStepError = (error: unknown): boolean =>
+    client.isPermissionDenied(error) || client.isLocatorInvalid(error)
+
   try {
     try {
       options.onOpen?.(frame)
     } catch (error) {
-      await frame.close().catch(() => {})
-      throw error
+      return await failed(error)
     }
     if (controller.signal.aborted) {
       return { status: 'closed', ...outcomeTag }
     }
 
-    if (adapter.onDocument) {
-      const onDocument = adapter.onDocument
-      frame.on(
-        'document',
-        (event) => {
-          if (controller.signal.aborted) return
-          activeDocController?.abort()
-          const docController = new AbortController()
-          activeDocController = docController
-          const onParentAbort = () => docController.abort()
-          controller.signal.addEventListener('abort', onParentAbort, { once: true })
-          const docCtx = createContext(docController.signal)
-          void Promise.resolve()
-            .then(() => {
-              if (docController.signal.aborted) return
-              return onDocument(docCtx, event.origin)
-            })
-            .catch(() => {})
-            .finally(() => controller.signal.removeEventListener('abort', onParentAbort))
-        },
-        { signal: controller.signal },
-      )
-    }
+    const onDocument = adapter.onDocument
+    frame.on(
+      'document',
+      (event) => {
+        if (controller.signal.aborted) return
+        origin = event.origin
+        if (!onDocument) return
+        activeDocController?.abort()
+        const docController = new AbortController()
+        activeDocController = docController
+        const onParentAbort = () => docController.abort()
+        controller.signal.addEventListener('abort', onParentAbort, { once: true })
+        const docCtx = createContext(docController.signal)
+        void Promise.resolve()
+          .then(() => {
+            if (docController.signal.aborted) return
+            return onDocument(docCtx, event.origin)
+          })
+          .catch(() => {})
+          .finally(() => controller.signal.removeEventListener('abort', onParentAbort))
+      },
+      { signal: controller.signal },
+    )
 
     const gotoTimeoutMs = adapter.gotoTimeoutMs ?? DEFAULT_GOTO_TIMEOUT_MS
     try {
@@ -254,9 +270,7 @@ const runAttachedWindow = async <TSession>(
         return { status: 'closed', ...outcomeTag }
       }
     } catch (error) {
-      if (controller.signal.aborted || isTerminalDetachError(error, client)) {
-        return { status: 'closed', ...outcomeTag }
-      }
+      // the window closing settles `closed` before its calls reject, so a closed window is seen here
       const closedNow = await Promise.race([
         frame.closed.then(() => true, () => true),
         Promise.resolve().then(() => false),
@@ -264,66 +278,62 @@ const runAttachedWindow = async <TSession>(
       if (closedNow || controller.signal.aborted) {
         return { status: 'closed', ...outcomeTag }
       }
-      await frame.close().catch(() => {})
-      throw error
+      return await failed(error)
     }
 
     const readTimeoutMs = adapter.readTimeoutMs ?? DEFAULT_READ_TIMEOUT_MS
     const pollMs = adapter.pollMs ?? DEFAULT_POLL_MS
-    const ctx = createContext(controller.signal)
+
+    // Runs one adapter step under the read timeout: 'closed' once the window ended, the step's error when
+    // it can never succeed, or its result (undefined after a recoverable failure).
+    const runStep = async <T>(step: string, read: () => Promise<T>): Promise<'closed' | { fatal: unknown } | Settled<T>> => {
+      const settled = await Promise.race([bounded(readTimeoutMs, controller.signal, step, read), ended])
+      if (settled === 'closed' || controller.signal.aborted) return 'closed'
+      if (!settled.ok && isFatalStepError(settled.error)) return { fatal: settled.error }
+      return settled
+    }
 
     if (adapter.prepare) {
-      const prep = await Promise.race([
-        bounded(readTimeoutMs, controller.signal, () => adapter.prepare!(ctx).then(() => true as const)),
-        ended,
-      ])
-      if (prep === 'closed' || controller.signal.aborted) {
-        return { status: 'closed', ...outcomeTag }
-      }
+      const prepare = adapter.prepare
+      const prep = await runStep('prepare', () => prepare(createContext(controller.signal)))
+      if (prep === 'closed') return { status: 'closed', ...outcomeTag }
+      if ('fatal' in prep) return await failed(prep.fatal)
     }
 
     for (;;) {
       await sleepAbortable(pollMs, controller.signal)
       if (controller.signal.aborted) return { status: 'closed', ...outcomeTag }
 
-      const signedIn = await Promise.race([
-        bounded(readTimeoutMs, controller.signal, () => adapter.isSignedIn(frame, ctx)),
-        ended,
-      ])
-      if (signedIn === 'closed' || controller.signal.aborted) {
-        return { status: 'closed', ...outcomeTag }
-      }
+      const ctx = createContext(controller.signal)
+      const signedIn = await runStep('isSignedIn', () => adapter.isSignedIn(frame, ctx))
+      if (signedIn === 'closed') return { status: 'closed', ...outcomeTag }
+      if ('fatal' in signedIn) return await failed(signedIn.fatal)
 
-      if (signedIn === true) {
-        let session: TSession | undefined
-        if (adapter.extractSession) {
-          const extracted = await Promise.race([
-            bounded(
-              readTimeoutMs,
-              controller.signal,
-              () => adapter.extractSession!(frame).then((value) => ({ ok: true as const, value })),
-            ),
-            ended,
-          ])
-          if (extracted === 'closed' || controller.signal.aborted) {
-            return { status: 'closed', ...outcomeTag }
-          }
-          if (extracted?.ok) session = extracted.value
+      if (signedIn.ok && signedIn.value === true) {
+        if (!adapter.extractSession) {
+          await frame.close()
+          return { status: 'authed', ...outcomeTag }
         }
+        const extractSession = adapter.extractSession
+        const extracted = await Promise.race([
+          bounded(readTimeoutMs, controller.signal, 'extractSession', () => extractSession(frame)),
+          ended,
+        ])
+        if (extracted === 'closed' || controller.signal.aborted) {
+          return { status: 'closed', ...outcomeTag }
+        }
+        if (!extracted.ok) return await failed(extracted.error)
         await frame.close()
-        return session !== undefined
-          ? { status: 'authed', ...outcomeTag, session }
+        return extracted.value !== undefined
+          ? { status: 'authed', ...outcomeTag, session: extracted.value }
           : { status: 'authed', ...outcomeTag }
       }
 
       if (adapter.onTick) {
-        const tick = await Promise.race([
-          bounded(readTimeoutMs, controller.signal, () => adapter.onTick!(ctx).then(() => true as const)),
-          ended,
-        ])
-        if (tick === 'closed' || controller.signal.aborted) {
-          return { status: 'closed', ...outcomeTag }
-        }
+        const onTick = adapter.onTick
+        const tick = await runStep('onTick', () => onTick(ctx))
+        if (tick === 'closed') return { status: 'closed', ...outcomeTag }
+        if ('fatal' in tick) return await failed(tick.fatal)
       }
     }
   } finally {

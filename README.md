@@ -18,7 +18,7 @@ Call `openAuthWindow` directly inside a user click or key handler so `client.att
 
 ```ts
 import { openAuthWindow } from '@banou/fkn-3p-auth'
-import { attachFrame, isTerminalError } from '@fkn/lib'
+import { attachFrame, isLocatorInvalid, isPermissionDenied } from '@fkn/lib'
 
 const outcome = await openAuthWindow(
   {
@@ -29,10 +29,12 @@ const outcome = await openAuthWindow(
     isSignedIn: (frame) => frame.evaluate(() => Boolean(document.querySelector('a[href^="/user/"]'))),
   },
   {
-    client: { attachFrame, isTerminalError },
+    client: { attachFrame, isLocatorInvalid, isPermissionDenied },
   },
 )
 ```
+
+The outcome is `authed` (with `session` when `extractSession` returns one), `closed` when the window ended, `blocked`, `unsupported`, `not-ready`, or `failed` with the `error` that stopped the flow: an attach, `goto` or `extractSession` failure, a throwing `onOpen`, or a step error that cannot recover (a refused consent or an invalid locator). A step error that can recover, such as a read while the window is on a host outside `domains`, keeps the flow polling.
 
 For deferred `@fkn/lib` loaders, pass a getter and `onNotReady`:
 

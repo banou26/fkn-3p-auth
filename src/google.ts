@@ -21,9 +21,8 @@ export type GooglePasskeySelectors = {
 }
 
 /**
- * Default passkey selectors. Kept empty until live Checklist items 1 and 4 capture verified
- * `accounts.google.com` DOM attributes across `/v3/signin/challenge/sk/webauthn`,
- * `/v3/signin/challenge/sk/error`, and `/v3/signin/challenge/selection`.
+ * Default passkey selectors. Empty until they are verified against live `accounts.google.com`
+ * challenge pages, which leaves the passkey assist off; pass `selectors` to turn it on.
  */
 export const GOOGLE_PASSKEY_SELECTORS: GooglePasskeySelectors = {
   passkeyPrompt: '',
@@ -58,15 +57,21 @@ export type GoogleAuthAdapterOptions<TSession = void> = {
 
 const DEFAULT_MAX_TRY_ANOTHER_WAY_CLICKS = 2
 const DEFAULT_STEP_COOLDOWN_MS = 3_000
+const GOOGLE_ACCOUNTS_ORIGIN = 'https://accounts.google.com'
+
+// An empty origin is unknown (the extension does not report it), so the step runs as it would unscoped.
+const isOn = (origin: string, expected: string): boolean => origin === '' || origin === expected
 
 /**
  * Builds an `AuthAdapter` for Google-backed sign-in flows across `@fkn/lib`:
  * - Includes `accounts.google.com` in `domains` by default so popup assists stay inside scope.
  * - Requests `'interaction'` only by default (never `'evaluation'` on `accounts.google.com`).
- * - Clicks `loginLinkSelector` once via severity-0 visibility check and locator click.
- * - Optionally hides passkey rows on `/challenge/selection` via severity-0 `addStyleTag` and clicks
- *   `"Try another way"` on passkey screens with selection guard, cooldown, and per-window cap when
- *   selectors are configured and `assistPasskey` applies.
+ * - Clicks `loginLinkSelector` once, only while the window shows the `entryUrl` origin, via a
+ *   severity-0 visibility check and locator click.
+ * - On `accounts.google.com` only, optionally hides passkey rows on `/challenge/selection` via
+ *   severity-0 `addStyleTag` and clicks `"Try another way"` on passkey screens with selection guard,
+ *   cooldown, and per-window cap when selectors are configured and `assistPasskey` applies.
+ * - Where the backend does not report the window's origin (the extension), both steps run unscoped.
  */
 export const createGoogleAuthAdapter = <TSession = void>(
   options: GoogleAuthAdapterOptions<TSession> = {},
@@ -86,20 +91,15 @@ export const createGoogleAuthAdapter = <TSession = void>(
   }
 
   const tryAnotherWayClicks = new WeakMap<WindowFrame, number>()
+  const entryUrl = options.entryUrl ?? 'https://www.youtube.com/'
+  const entryOrigin = new URL(entryUrl).origin
 
   const passkeyAssistEnabled = (ctx: AuthStepContext): boolean =>
     assistPasskey === 'always' || (assistPasskey === 'cloud-only' && ctx.backend !== 'extension')
 
-  const applyPasskeyCss = async (ctx: AuthStepContext): Promise<void> => {
-    if (!passkeyAssistEnabled(ctx) || !hidePasskeyChoices || ctx.signal.aborted) return
-    const css = selectors.passkeyChoiceCss.trim()
-    if (!css) return
-    await ctx.frame.addStyleTag({ content: css })
-  }
-
   return {
     id: options.id ?? 'google',
-    entryUrl: options.entryUrl ?? 'https://www.youtube.com/',
+    entryUrl,
     domains: [...(options.domains ?? DEFAULT_GOOGLE_DOMAINS)],
     cookies: options.cookies ?? 'persistent',
     ...(options.fallbackCookies === undefined ? {} : { fallbackCookies: options.fallbackCookies }),
@@ -108,12 +108,14 @@ export const createGoogleAuthAdapter = <TSession = void>(
     ...(options.pollMs === undefined ? {} : { pollMs: options.pollMs }),
     ...(options.readTimeoutMs === undefined ? {} : { readTimeoutMs: options.readTimeoutMs }),
     ...(options.gotoTimeoutMs === undefined ? {} : { gotoTimeoutMs: options.gotoTimeoutMs }),
-    prepare: applyPasskeyCss,
-    onDocument: async (ctx) => {
-      await applyPasskeyCss(ctx)
+    onDocument: async (ctx, origin) => {
+      if (!isOn(origin, GOOGLE_ACCOUNTS_ORIGIN) || !passkeyAssistEnabled(ctx) || !hidePasskeyChoices) return
+      const css = selectors.passkeyChoiceCss.trim()
+      if (!css || ctx.signal.aborted) return
+      await ctx.frame.addStyleTag({ content: css })
     },
     onTick: async (ctx) => {
-      if (loginLinkSelector) {
+      if (loginLinkSelector && isOn(ctx.origin, entryOrigin)) {
         if (await ctx.frame.locator(loginLinkSelector).first().isVisible()) {
           await ctx.once('click-service-login', async () => {
             await ctx.frame.locator(loginLinkSelector).first().click({ reason: interactionReason })
@@ -122,6 +124,7 @@ export const createGoogleAuthAdapter = <TSession = void>(
       }
 
       if (
+        !isOn(ctx.origin, GOOGLE_ACCOUNTS_ORIGIN) ||
         !passkeyAssistEnabled(ctx) ||
         !selectors.passkeyPrompt ||
         !selectors.selectionList ||
