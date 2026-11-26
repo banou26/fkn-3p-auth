@@ -9,6 +9,7 @@ import {
   isFrameWindowRefusedError,
   timeoutError,
 } from './errors.js'
+import { clampDelay } from './timers.js'
 import {
   resolveClient,
   type AuthAdapter,
@@ -23,6 +24,7 @@ import {
 const DEFAULT_POLL_MS = 1_000
 const DEFAULT_READ_TIMEOUT_MS = 5_000
 const DEFAULT_GOTO_TIMEOUT_MS = 30_000
+const MAX_EXTRACT_ATTEMPTS = 3
 
 /** Runtime overrides passed to `openAuthWindow`. */
 export type OpenAuthWindowOptions = {
@@ -89,7 +91,7 @@ const sleepAbortable = (ms: number, signal: AbortSignal): Promise<void> =>
     const timer = setTimeout(() => {
       signal.removeEventListener('abort', onAbort)
       resolve()
-    }, ms)
+    }, clampDelay(ms))
     signal.addEventListener('abort', onAbort, { once: true })
   })
 
@@ -107,7 +109,7 @@ const bounded = <T>(ms: number, signal: AbortSignal, step: string, read: () => P
     ),
     new Promise<Settled<T>>((resolve) => {
       onAbort = () => resolve({ ok: false, error: signal.reason })
-      timer = setTimeout(() => resolve({ ok: false, error: timeoutError(`openAuthWindow: ${step} did not settle within ${ms}ms`) }), ms)
+      timer = setTimeout(() => resolve({ ok: false, error: timeoutError(`openAuthWindow: ${step} did not settle within ${ms}ms`) }), clampDelay(ms))
       signal.addEventListener('abort', onAbort, { once: true })
     }),
   ]).finally(() => {
@@ -221,10 +223,22 @@ const runAttachedWindow = async <TSession>(
     return { status: 'failed', ...outcomeTag, error }
   }
 
-  // A refused consent or a malformed step never succeeds on a later tick; anything else (a read on a host
-  // outside `domains`, a timeout, a page mid-navigation) may.
+  // Signed in already: a close that fails does not undo that, so it never turns into a rejection.
+  const authed = async (session: TSession | undefined): Promise<AuthOutcome<TSession>> => {
+    await frame.close().catch(() => {})
+    return session !== undefined ? { status: 'authed', ...outcomeTag, session } : { status: 'authed', ...outcomeTag }
+  }
+
+  // The window closing settles `closed` before its calls reject, so a closed window is seen here.
+  const closedNow = (): Promise<boolean> => Promise.race([
+    frame.closed.then(() => true, () => true),
+    Promise.resolve().then(() => false),
+  ])
+
+  // A refused consent, a malformed step, or an operation this window cannot run never succeeds on a later tick;
+  // anything else (a read on a host outside `domains`, a timeout, a page mid-navigation) may.
   const isFatalStepError = (error: unknown): boolean =>
-    client.isPermissionDenied(error) || client.isLocatorInvalid(error)
+    client.isPermissionDenied(error) || client.isLocatorInvalid(error) || client.isLocatorUnsupported(error)
 
   try {
     try {
@@ -270,12 +284,7 @@ const runAttachedWindow = async <TSession>(
         return { status: 'closed', ...outcomeTag }
       }
     } catch (error) {
-      // the window closing settles `closed` before its calls reject, so a closed window is seen here
-      const closedNow = await Promise.race([
-        frame.closed.then(() => true, () => true),
-        Promise.resolve().then(() => false),
-      ])
-      if (closedNow || controller.signal.aborted) {
+      if (await closedNow() || controller.signal.aborted) {
         return { status: 'closed', ...outcomeTag }
       }
       return await failed(error)
@@ -284,13 +293,15 @@ const runAttachedWindow = async <TSession>(
     const readTimeoutMs = adapter.readTimeoutMs ?? DEFAULT_READ_TIMEOUT_MS
     const pollMs = adapter.pollMs ?? DEFAULT_POLL_MS
 
-    // Runs one adapter step under the read timeout: 'closed' once the window ended, the step's error when
-    // it can never succeed, or its result (undefined after a recoverable failure).
+    // Runs one adapter step under the read timeout: 'closed' once the window ended (checked before any error is
+    // judged, since a closed window's calls reject too), `fatal` with an error no later tick can get past, or the
+    // settled result, whose `ok: false` is a failure the next tick may recover from.
     const runStep = async <T>(step: string, read: () => Promise<T>): Promise<'closed' | { fatal: unknown } | Settled<T>> => {
       const settled = await Promise.race([bounded(readTimeoutMs, controller.signal, step, read), ended])
       if (settled === 'closed' || controller.signal.aborted) return 'closed'
-      if (!settled.ok && isFatalStepError(settled.error)) return { fatal: settled.error }
-      return settled
+      if (settled.ok) return settled
+      if (await closedNow() || controller.signal.aborted) return 'closed'
+      return isFatalStepError(settled.error) ? { fatal: settled.error } : settled
     }
 
     if (adapter.prepare) {
@@ -300,6 +311,7 @@ const runAttachedWindow = async <TSession>(
       if ('fatal' in prep) return await failed(prep.fatal)
     }
 
+    let extractAttempts = 0
     for (;;) {
       await sleepAbortable(pollMs, controller.signal)
       if (controller.signal.aborted) return { status: 'closed', ...outcomeTag }
@@ -310,23 +322,16 @@ const runAttachedWindow = async <TSession>(
       if ('fatal' in signedIn) return await failed(signedIn.fatal)
 
       if (signedIn.ok && signedIn.value === true) {
-        if (!adapter.extractSession) {
-          await frame.close()
-          return { status: 'authed', ...outcomeTag }
-        }
+        if (!adapter.extractSession) return await authed(undefined)
         const extractSession = adapter.extractSession
-        const extracted = await Promise.race([
-          bounded(readTimeoutMs, controller.signal, 'extractSession', () => extractSession(frame)),
-          ended,
-        ])
-        if (extracted === 'closed' || controller.signal.aborted) {
-          return { status: 'closed', ...outcomeTag }
-        }
-        if (!extracted.ok) return await failed(extracted.error)
-        await frame.close()
-        return extracted.value !== undefined
-          ? { status: 'authed', ...outcomeTag, session: extracted.value }
-          : { status: 'authed', ...outcomeTag }
+        const extracted = await runStep('extractSession', () => extractSession(frame))
+        if (extracted === 'closed') return { status: 'closed', ...outcomeTag }
+        if ('fatal' in extracted) return await failed(extracted.fatal)
+        if (extracted.ok) return await authed(extracted.value)
+        // a recoverable failure (the page still settling after sign-in) gets the next ticks, a bounded few
+        extractAttempts += 1
+        if (extractAttempts >= MAX_EXTRACT_ATTEMPTS) return await failed(extracted.error)
+        continue
       }
 
       if (adapter.onTick) {

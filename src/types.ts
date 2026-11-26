@@ -13,7 +13,7 @@ export type AuthBackend = 'cloud' | 'extension'
 export type CloudCookies = 'persistent' | 'ephemeral'
 
 /** The `@fkn/lib` members auth helpers call, passed in so the package never imports `@fkn/lib` at runtime. */
-export type FknClient = Pick<typeof import('@fkn/lib'), 'attachFrame' | 'isLocatorInvalid' | 'isPermissionDenied'>
+export type FknClient = Pick<typeof import('@fkn/lib'), 'attachFrame' | 'isLocatorInvalid' | 'isLocatorUnsupported' | 'isPermissionDenied'>
 
 /** Static client object or synchronous getter returning the client once loaded. */
 export type ClientSource = FknClient | (() => FknClient | undefined)

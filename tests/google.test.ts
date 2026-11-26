@@ -1,6 +1,6 @@
 import type { WindowFrame } from '@fkn/lib'
 
-import { isLocatorInvalid, isPermissionDenied } from '@fkn/lib'
+import { isLocatorInvalid, isLocatorUnsupported, isPermissionDenied } from '@fkn/lib'
 import { describe, expect, it, vi } from 'vite-plus/test'
 
 import { openAuthWindow, type FknClient } from '../src'
@@ -13,7 +13,7 @@ import {
 } from '../src/google'
 
 const clientWith = (attachFrame: unknown): FknClient =>
-  ({ attachFrame, isLocatorInvalid, isPermissionDenied }) as unknown as FknClient
+  ({ attachFrame, isLocatorInvalid, isLocatorUnsupported, isPermissionDenied }) as unknown as FknClient
 
 type FakePageState = {
   visible: Set<string>

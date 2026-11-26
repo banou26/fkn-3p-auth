@@ -6,6 +6,7 @@ import {
   FrameWindowBlockedError,
   FrameWindowRefusedError,
   isLocatorInvalid,
+  isLocatorUnsupported,
   isPermissionDenied,
   LOCATOR_DENIED,
   LOCATOR_INVALID,
@@ -17,7 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 import { openAuthWindow, type AuthAdapter, type AuthStepContext, type FknClient } from '../src'
 
 const clientWith = (attachFrame: unknown): FknClient =>
-  ({ attachFrame, isLocatorInvalid, isPermissionDenied }) as unknown as FknClient
+  ({ attachFrame, isLocatorInvalid, isLocatorUnsupported, isPermissionDenied }) as unknown as FknClient
 
 // @fkn/lib's locator and consent errors are plain Errors told apart by name, which is all its guards read
 const libError = (name: string, message = name) => Object.assign(new Error(message), { name })
@@ -306,6 +307,80 @@ describe('openAuthWindow', () => {
       }),
       { client: clientWith(vi.fn(async () => offHost.frame)) },
     )).toEqual({ status: 'authed', backend: 'cloud' })
+  })
+
+  it('fails fast on LocatorUnsupportedError while the window is open, and reports closed once it closed', async () => {
+    const hung = <T>(run: Promise<T>) => Promise.race([run, new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 500))])
+
+    const unsupported = libError(LOCATOR_UNSUPPORTED, 'frame.addScriptTag: this render proxy predates addScriptTag; reload the app')
+    const open = fakeWindow()
+    expect(await hung(openAuthWindow(
+      baseAdapter({ isSignedIn: async () => { throw unsupported } }),
+      { client: clientWith(vi.fn(async () => open.frame)) },
+    ))).toEqual({ status: 'failed', backend: 'cloud', error: unsupported })
+
+    const closing = fakeWindow()
+    expect(await hung(openAuthWindow(
+      baseAdapter({
+        isSignedIn: async () => {
+          queueMicrotask(() => closing.end())
+          throw libError(LOCATOR_UNSUPPORTED, 'cloud.attachFrame: the attached window closed; attach a fresh window')
+        },
+      }),
+      { client: clientWith(vi.fn(async () => closing.frame)) },
+    ))).toEqual({ status: 'closed', backend: 'cloud' })
+  })
+
+  it('retries a recoverable extractSession failure a bounded few ticks, and a failing close still returns authed', async () => {
+    let calls = 0
+    const settling = fakeWindow()
+    expect(await openAuthWindow(
+      baseAdapter<string>({
+        isSignedIn: async () => true,
+        extractSession: async () => {
+          calls += 1
+          if (calls === 1) throw libError(LOCATOR_DENIED, 'evaluate: the window is on a host outside domains')
+          return 'token'
+        },
+      }),
+      { client: clientWith(vi.fn(async () => settling.frame)) },
+    )).toEqual({ status: 'authed', backend: 'cloud', session: 'token' })
+    expect(calls).toBe(2)
+
+    let attempts = 0
+    const denied = libError(LOCATOR_DENIED, 'evaluate: the window is on a host outside domains')
+    const neverSettles = fakeWindow()
+    expect(await openAuthWindow(
+      baseAdapter<string>({
+        isSignedIn: async () => true,
+        extractSession: async () => {
+          attempts += 1
+          throw denied
+        },
+      }),
+      { client: clientWith(vi.fn(async () => neverSettles.frame)) },
+    )).toEqual({ status: 'failed', backend: 'cloud', error: denied })
+    expect(attempts).toBe(3)
+
+    const closeFails = fakeWindow()
+    closeFails.close.mockImplementation(async () => { throw new Error('close failed') })
+    expect(await openAuthWindow(
+      baseAdapter({ isSignedIn: async () => true }),
+      { client: clientWith(vi.fn(async () => closeFails.frame)) },
+    )).toEqual({ status: 'authed', backend: 'cloud' })
+  })
+
+  it('waits on an Infinity read timeout instead of timing out at once', async () => {
+    const win = fakeWindow()
+    const run = openAuthWindow(
+      baseAdapter({
+        readTimeoutMs: Number.POSITIVE_INFINITY,
+        isSignedIn: () => new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 30)),
+      }),
+      { client: clientWith(vi.fn(async () => win.frame)) },
+    )
+    expect(await Promise.race([run, new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 1_000))]))
+      .toEqual({ status: 'authed', backend: 'cloud' })
   })
 
   it('passes the latest document origin to each step', async () => {
