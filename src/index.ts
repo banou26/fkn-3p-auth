@@ -2,9 +2,17 @@ export { openAuthWindow, type OpenAuthWindowOptions } from './window.js'
 export { signOutFromCloud, type SignOutOptions, type SignOutResult } from './cloud-sign-out.js'
 export { verifyHiddenSession, type VerifyHiddenSessionOptions } from './hidden-session.js'
 export {
+  assertPermissionReasons,
+  frameWindowRefusalOf,
+  isAttachWindowUnsupportedError,
+  isExtensionUnsupportedError,
+  isFrameWindowBlockedError,
+  isFrameWindowRefusedError,
+  MAX_PERMISSION_REASON_LENGTH,
+} from './errors.js'
+export {
   createSessionSync,
   type ChannelLike,
-  type SessionLifecycleEvent,
   type SessionSync,
   type SessionSyncOptions,
   type StorageChange,

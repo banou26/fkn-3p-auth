@@ -1,11 +1,8 @@
 import type { WindowFrame } from '@fkn/lib'
 
-/** Standard auth lifecycle event names emitted over `BroadcastChannel`. */
-export type SessionLifecycleEvent = 'signing-out' | 'signed-out' | 'signed-in' | 'switched'
-
-/** Cross-tab `localStorage` change forwarded by `createSessionSync`. */
+/** Cross-tab `localStorage` change forwarded by `createSessionSync`; `key` is `null` when another tab cleared the storage. */
 export type StorageChange = {
-  key: string
+  key: string | null
   oldValue: string | null
   newValue: string | null
 }
@@ -87,8 +84,8 @@ export const createSessionSync = <TMessage = unknown>(
 
   const storageTarget = options.storageTarget ?? defaultStorageTarget()
   const handleStorageEvent = (event: StorageEvent) => {
-    if (disposed || !event.key) return
-    if (watchedKeys && !watchedKeys.has(event.key)) return
+    if (disposed) return
+    if (event.key !== null && watchedKeys && !watchedKeys.has(event.key)) return
     const change: StorageChange = {
       key: event.key,
       oldValue: event.oldValue,

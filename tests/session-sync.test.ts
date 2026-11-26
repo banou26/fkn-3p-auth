@@ -5,7 +5,6 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test'
 import {
   createSessionSync,
   type ChannelLike,
-  type SessionLifecycleEvent,
   type StorageChange,
   type StorageEventTarget,
 } from '../src'
@@ -59,8 +58,6 @@ describe('createSessionSync', () => {
   })
 
   it('delivers messages across tabs, filters storage keys with oldValue/newValue, and disposes cleanly', () => {
-    const lifecycleEvent: SessionLifecycleEvent = 'signed-in'
-    expect(['signing-out', 'signed-out', 'signed-in', 'switched']).toContain(lifecycleEvent)
     const broadcastChannel = createHub()
     const storage = createStorageTarget()
     const tabAMessages: unknown[] = []
@@ -81,18 +78,20 @@ describe('createSessionSync', () => {
     })
 
     tabB.post('anilist')
-    tabB.post(lifecycleEvent)
+    tabB.post('signed-in')
     expect(tabAMessages).toEqual(['anilist', 'signed-in'])
 
     storage.emit('unrelated', null, '1')
-    storage.emit(null, null, 'cleared')
     storage.emit('stub.site-status', '{"mal":{"state":"signed-out"}}', '{"mal":{"state":"signed-in"}}')
+    // another tab's localStorage.clear(): one event, every value null, watched keys or not
+    storage.emit(null, null, null)
     expect(tabAChanges).toEqual([
       {
         key: 'stub.site-status',
         oldValue: '{"mal":{"state":"signed-out"}}',
         newValue: '{"mal":{"state":"signed-in"}}',
       },
+      { key: null, oldValue: null, newValue: null },
     ])
 
     tabA.dispose()
