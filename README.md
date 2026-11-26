@@ -18,7 +18,7 @@ Call `openAuthWindow` directly inside a user click or key handler so `client.att
 
 ```ts
 import { openAuthWindow } from '@banou/fkn-3p-auth'
-import { attachFrame, isLocatorInvalid, isPermissionDenied } from '@fkn/lib'
+import { attachFrame, isLocatorInvalid, isLocatorUnsupported, isPermissionDenied } from '@fkn/lib'
 
 const outcome = await openAuthWindow(
   {
@@ -29,12 +29,12 @@ const outcome = await openAuthWindow(
     isSignedIn: (frame) => frame.evaluate(() => Boolean(document.querySelector('a[href^="/user/"]'))),
   },
   {
-    client: { attachFrame, isLocatorInvalid, isPermissionDenied },
+    client: { attachFrame, isLocatorInvalid, isLocatorUnsupported, isPermissionDenied },
   },
 )
 ```
 
-The outcome is `authed` (with `session` when `extractSession` returns one), `closed` when the window ended, `blocked`, `unsupported`, `not-ready`, or `failed` with the `error` that stopped the flow: an attach, `goto` or `extractSession` failure, a throwing `onOpen`, or a step error that cannot recover (a refused consent or an invalid locator). A step error that can recover, such as a read while the window is on a host outside `domains`, keeps the flow polling.
+The outcome is `authed` (with `session` when `extractSession` returns one), `closed` when the window ended, `blocked`, `unsupported`, `not-ready`, or `failed` with the `error` that stopped the flow: an attach or `goto` failure, a throwing `onOpen`, a step error that cannot recover (a refused consent, an invalid locator, or an operation the open window cannot run), or an `extractSession` that still fails after three tries. A step error that can recover, such as a read while the window is on a host outside `domains`, keeps the flow polling. A window that closes is `closed` whatever error its last call raised, and a `close()` that fails after sign-in still resolves `authed`.
 
 For deferred `@fkn/lib` loaders, pass a getter and `onNotReady`:
 
@@ -68,9 +68,13 @@ await signOutFromCloud({
 
 Mounts a hidden `blank` cloud frame at `url`, executes `probe(frame)`, optionally awaits `settle` or `postProbeSettleMs` before removing the iframe so jar cookie writes commit, and returns the probe result without holding persistent state.
 
+The whole check runs under `timeoutMs` (30,000 ms by default) and an optional `signal`. Past the deadline it rejects with an error named `TimeoutError`, on abort with the signal's reason; either way it stops after the step that was running and removes the iframe.
+
 ### `createSessionSync(options)`
 
 Wraps `BroadcastChannel`, filtered `storage` events (preserving `oldValue` / `newValue`), and active auth popup window tracking (`registerWindow`, `closeOnMessage`, `closeWindows`). Safe in Node/SSR environments where browser globals are absent.
+
+Another tab's `localStorage.clear()` arrives as one change with `key: null` and both values `null`, whatever `storageKeys` lists.
 
 ## Google / YouTube (`@banou/fkn-3p-auth/google`)
 
@@ -78,5 +82,6 @@ Provides `createGoogleAuthAdapter` and `youtubeAuthAdapter`:
 
 - Lists `['www.youtube.com', 'accounts.google.com']` in `domains` by default.
 - Requests `'interaction'` only (never `'evaluation'` on `accounts.google.com`).
-- Clicks `a[href*="ServiceLogin"]` once via severity-0 visibility check plus locator `.click()` instead of `evaluate`.
-- Re-applies severity-0 `addStyleTag` CSS and bounded `"Try another way"` clicks (`'cloud-only'` by default) when configured with verified passkey challenge selectors.
+- Clicks `a[href*="ServiceLogin"]` once via severity-0 visibility check plus locator `.click()` instead of `evaluate`, only while the window shows the exact origin of `entryUrl`.
+- Re-applies severity-0 `addStyleTag` CSS and bounded `"Try another way"` clicks (`'cloud-only'` by default) when configured with verified passkey challenge selectors, only while the window shows `https://accounts.google.com`.
+- Where the backend does not report the window's origin (the extension, whose `document` events carry `''`), both steps run without the origin check.
