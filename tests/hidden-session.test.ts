@@ -155,4 +155,39 @@ describe('verifyHiddenSession', () => {
     })).rejects.toThrow('already gone')
     expect(aborted.remove).not.toHaveBeenCalled()
   })
+  it('stops after the step the deadline interrupted, and clears the settle wait on abort', async () => {
+    const client = { attachFrame: vi.fn(async () => ({}) as Frame) } as unknown as FknClient
+    const settle = vi.fn(async () => {})
+    const late = await verifyHiddenSession({
+      client,
+      url: 'https://www.crunchyroll.com/',
+      mountHiddenFrame: () => ({ iframe: {} as HTMLIFrameElement, remove: () => {} }),
+      timeoutMs: 20,
+      probe: () => new Promise<boolean>((resolve) => setTimeout(() => resolve(true), 40)),
+      settle,
+    }).catch((error: unknown) => error)
+    expect((late as Error).name).toBe('TimeoutError')
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    expect(settle).not.toHaveBeenCalled()
+
+    vi.useFakeTimers()
+    try {
+      const controller = new AbortController()
+      const run = verifyHiddenSession({
+        client,
+        url: 'https://www.crunchyroll.com/',
+        mountHiddenFrame: () => ({ iframe: {} as HTMLIFrameElement, remove: () => {} }),
+        signal: controller.signal,
+        postProbeSettleMs: 10_000,
+        probe: async () => true,
+      })
+      run.catch(() => {})
+      await vi.advanceTimersByTimeAsync(0)
+      controller.abort(new Error('page left'))
+      await expect(run).rejects.toThrow('page left')
+      expect(vi.getTimerCount()).toBe(0)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

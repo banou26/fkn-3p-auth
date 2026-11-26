@@ -2,6 +2,7 @@ import type { CategoryRequest, Frame } from '@fkn/lib'
 
 import { assertPermissionReasons, timeoutError } from './errors.js'
 import { createHiddenFrame } from './hidden-frame.js'
+import { clampDelay } from './timers.js'
 import { resolveClient, type ClientSource, type CloudCookies, type MountHiddenFrame } from './types.js'
 
 /** Configuration for probing session state inside an off-screen cloud `blank` frame. */
@@ -24,26 +25,18 @@ export type VerifyHiddenSessionOptions<T> = {
 
 const DEFAULT_TIMEOUT_MS = 30_000
 
-const waitMs = (ms: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, ms))
-
-const withDeadline = <T>(work: Promise<T>, ms: number, signal: AbortSignal | undefined): Promise<T> =>
-  new Promise<T>((resolve, reject) => {
-    const cleanup = () => {
+// Resolves after `ms`, or rejects with the signal's reason and clears its timer when the signal aborts first.
+const waitMs = (ms: number, signal: AbortSignal): Promise<void> =>
+  new Promise((resolve, reject) => {
+    const onAbort = () => {
       clearTimeout(timer)
-      signal?.removeEventListener('abort', onAbort)
+      reject(signal.reason)
     }
-    const fail = (error: unknown) => {
-      cleanup()
-      reject(error)
-    }
-    const onAbort = () => fail(signal!.reason)
-    const timer = setTimeout(() => fail(timeoutError(`verifyHiddenSession: did not finish within ${ms}ms`)), ms)
-    signal?.addEventListener('abort', onAbort, { once: true })
-    work.then((value) => {
-      cleanup()
-      resolve(value)
-    }, fail)
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, clampDelay(ms))
+    signal.addEventListener('abort', onAbort, { once: true })
   })
 
 /**
@@ -71,26 +64,48 @@ export const verifyHiddenSession = async <T>({
     throw new Error('verifyHiddenSession: @fkn/lib client is not loaded')
   }
   signal?.throwIfAborted()
+  // one signal for the caller's abort and the deadline: the check stops after whichever step was running
+  const stop = new AbortController()
+  const onAbort = () => stop.abort(signal!.reason)
+  signal?.addEventListener('abort', onAbort, { once: true })
+  const deadline = setTimeout(
+    () => stop.abort(timeoutError(`verifyHiddenSession: did not finish within ${timeoutMs}ms`)),
+    clampDelay(timeoutMs),
+  )
+  const stopped = new Promise<never>((_, reject) => {
+    stop.signal.addEventListener('abort', () => reject(stop.signal.reason), { once: true })
+  })
   const { iframe, remove } = mountHiddenFrame(title)
+  const step = async <R>(work: Promise<R>): Promise<R> => {
+    const value = await work
+    stop.signal.throwIfAborted()
+    return value
+  }
   const check = async (): Promise<T> => {
     const resolvedPermissions = permissions?.length ? [...permissions] : undefined
-    const frame = await client.attachFrame({
+    const frame = await step(client.attachFrame({
       iframe,
       blank: { url },
       cookies,
       ...(resolvedPermissions ? { permissions: resolvedPermissions } : {}),
-    })
-    const result = await probe(frame)
+    }))
+    const result = await step(probe(frame))
     const needsSettle = shouldSettle ? shouldSettle(result) : true
     if (needsSettle) {
-      if (settle) await settle(result)
-      else if (postProbeSettleMs !== undefined && postProbeSettleMs > 0) await waitMs(postProbeSettleMs)
+      if (settle) await step(settle(result))
+      else if (postProbeSettleMs !== undefined && postProbeSettleMs > 0) await waitMs(postProbeSettleMs, stop.signal)
     }
     return result
   }
+  const running = check()
+  running.catch(() => {})
+  stopped.catch(() => {})
   try {
-    return await withDeadline(check(), timeoutMs, signal)
+    return await Promise.race([running, stopped])
   } finally {
+    clearTimeout(deadline)
+    signal?.removeEventListener('abort', onAbort)
+    stop.abort()
     remove()
   }
 }
