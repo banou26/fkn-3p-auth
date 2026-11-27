@@ -83,5 +83,6 @@ Provides `createGoogleAuthAdapter` and `youtubeAuthAdapter`:
 - Lists `['www.youtube.com', 'accounts.google.com']` in `domains` by default.
 - Requests `'interaction'` only (never `'evaluation'` on `accounts.google.com`).
 - Clicks `a[href*="ServiceLogin"]` once via severity-0 visibility check plus locator `.click()` instead of `evaluate`, only while the window shows the exact origin of `entryUrl`.
+- Hides Google's `/v3/signin/rejected` ("browser or app may not be secure") screen via severity-0 `addStyleTag` and clicks `"Try again"` (`a[href*="/restart"]`) up to `maxRejectedBrowserRetries` (`2` by default) with cooldown (`stepCooldownMs`, `3,000` ms) while `assistRejectedBrowser` (`'always'` by default) applies, then reveals the page if still rejected after the retry budget is exhausted.
 - Re-applies severity-0 `addStyleTag` CSS and bounded `"Try another way"` clicks (`'cloud-only'` by default) when configured with verified passkey challenge selectors, only while the window shows `https://accounts.google.com`.
 - Where the backend does not report the window's origin (the extension, whose `document` events carry `''`), both steps run without the origin check.
