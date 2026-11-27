@@ -1,6 +1,6 @@
 import type { WindowFrame } from '@fkn/lib'
 
-import { isLocatorInvalid, isLocatorUnsupported, isPermissionDenied } from '@fkn/lib'
+import { isLocatorInvalid, isLocatorUnsupported, isPermissionDenied, LOCATOR_INVALID } from '@fkn/lib'
 import { describe, expect, it, vi } from 'vite-plus/test'
 
 import { openAuthWindow, type FknClient } from '../src'
@@ -44,14 +44,16 @@ const fakeGoogleWindow = (backendOrOptions: 'cloud' | 'extension' | FakeWindowOp
   const close = vi.fn(async () => { resolveClosed() })
   const goto = vi.fn(async () => {})
   const isVisibleCalls: string[] = []
-  let throwNextIsVisibleTimeout = false
+  const timeoutSelectors = new Set<string>()
+  const fatalErrorSelectors = new Map<string, Error>()
 
   const makeLocator = (selector: string) => ({
     first: () => makeLocator(selector),
     isVisible: async () => {
       isVisibleCalls.push(selector)
-      if (throwNextIsVisibleTimeout) {
-        throwNextIsVisibleTimeout = false
+      const fatal = fatalErrorSelectors.get(selector)
+      if (fatal) throw fatal
+      if (timeoutSelectors.has(selector)) {
         throw Object.assign(new Error('No elements found'), { name: 'TimeoutError' })
       }
       if (strictIsVisible && !page.visible.has(selector)) {
@@ -93,7 +95,8 @@ const fakeGoogleWindow = (backendOrOptions: 'cloud' | 'extension' | FakeWindowOp
     evaluate,
     addStyleTag,
     isVisibleCalls,
-    failNextIsVisibleTimeout: () => { throwNextIsVisibleTimeout = true },
+    timeoutSelectors,
+    fatalErrorSelectors,
     emitDocument: (origin: string) => {
       for (const listener of docListeners) listener({ type: 'document', origin })
     },
@@ -318,7 +321,10 @@ describe('Google auth adapter', () => {
 
     const win = fakeGoogleWindow('cloud')
     const adapter = youtubeAuthAdapter({ pollMs: 1, stepCooldownMs: 50 })
-    const run = openAuthWindow(adapter, { client: clientWith(vi.fn(async () => win.frame)) })
+    const run = openAuthWindow(adapter, {
+      client: clientWith(vi.fn(async () => win.frame)),
+      now: () => 1_000,
+    })
 
     await vi.waitFor(() => expect(win.clicks).toHaveLength(1))
     win.emitDocument('https://www.youtube.com')
@@ -345,7 +351,7 @@ describe('Google auth adapter', () => {
     expect(await run).toEqual({ status: 'authed', backend: 'cloud' })
   })
 
-  it('falls back to hiding on tick when onDocument was missed, honors retry cap, and reveals after cooldown', async () => {
+  it('honors rejected-browser retry cap, reveals after cooldown, and isolates per-window fallback state', async () => {
     const adapter = youtubeAuthAdapter({
       pollMs: 1,
       stepCooldownMs: 100,
@@ -403,7 +409,7 @@ describe('Google auth adapter', () => {
     expect(await run).toEqual({ status: 'authed', backend: 'cloud' })
 
     // Second window reusing the same adapter receives a fresh retry budget and hides via tick fallback if onDocument didn't precede.
-    const win2 = fakeGoogleWindow('extension')
+    const win2 = fakeGoogleWindow('cloud')
     win2.page.visible.clear()
     win2.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
     win2.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.retry)
@@ -414,18 +420,21 @@ describe('Google auth adapter', () => {
     await vi.waitFor(() => expect(win2.clicks).toHaveLength(1))
     expect(win2.styles).toEqual([{ content: GOOGLE_REJECTED_BROWSER_SELECTORS.hideCss }])
     win2.page.avatarCount = 1
-    expect(await run2).toEqual({ status: 'authed', backend: 'extension' })
+    expect(await run2).toEqual({ status: 'authed', backend: 'cloud' })
   })
 
-  it('respects dead-end guards, assistRejectedBrowser modes, hideRejectedBrowser, and custom selectors', async () => {
-    // Marker visible without retry link: dead-end rejected screen must not click.
+  it('respects dead-end guards, assistRejectedBrowser modes, hideRejectedBrowser, normalized retry caps, and custom selectors', async () => {
+    // Marker visible without retry link: dead-end rejected screen keeps hiding off via :has(retry) and does not click.
     const deadEnd = fakeGoogleWindow('cloud')
+    deadEnd.goto.mockImplementation(async () => {
+      deadEnd.emitDocument('https://accounts.google.com')
+    })
     deadEnd.page.visible.clear()
     deadEnd.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
-    deadEnd.emitDocument('https://accounts.google.com')
     const deadEndRun = openAuthWindow(youtubeAuthAdapter({ pollMs: 1 }), {
       client: clientWith(vi.fn(async () => deadEnd.frame)),
     })
+    await vi.waitFor(() => expect(deadEnd.addStyleTag).toHaveBeenCalledTimes(1))
     await new Promise((resolve) => setTimeout(resolve, 20))
     expect(deadEnd.clicks).toHaveLength(0)
     deadEnd.page.avatarCount = 1
@@ -448,36 +457,76 @@ describe('Google auth adapter', () => {
     noHide.page.avatarCount = 1
     expect(await noHideRun).toEqual({ status: 'authed', backend: 'cloud' })
 
-    // assistRejectedBrowser: 'cloud-only' skips extension backend; 'off' skips cloud too.
-    const extCloudOnly = fakeGoogleWindow('extension')
-    extCloudOnly.page.visible.clear()
-    extCloudOnly.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
-    extCloudOnly.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.retry)
-    const extCloudOnlyRun = openAuthWindow(
-      createGoogleAuthAdapter({ pollMs: 1, assistRejectedBrowser: 'cloud-only' }),
-      { client: clientWith(vi.fn(async () => extCloudOnly.frame)) },
-    )
-    extCloudOnly.emitDocument('')
-    await new Promise((resolve) => setTimeout(resolve, 20))
-    expect(extCloudOnly.addStyleTag).not.toHaveBeenCalled()
-    expect(extCloudOnly.clicks).toHaveLength(0)
-    extCloudOnly.page.avatarCount = 1
-    expect(await extCloudOnlyRun).toEqual({ status: 'authed', backend: 'extension' })
+    // Default assistRejectedBrowser ('cloud-only') and 'off' skip extension/cloud, while 'always' runs on extension.
+    for (const [backend, assistRejectedBrowser, origin, expectActive] of [
+      ['extension', undefined, '', false],
+      ['cloud', 'off', 'https://accounts.google.com', false],
+      ['extension', 'always', '', true],
+    ] as const) {
+      const modeWin = fakeGoogleWindow(backend)
+      modeWin.goto.mockImplementation(async () => {
+        modeWin.emitDocument(origin)
+      })
+      modeWin.page.visible.clear()
+      modeWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
+      modeWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.retry)
+      const modeRun = openAuthWindow(
+        createGoogleAuthAdapter({
+          pollMs: 1,
+          ...(assistRejectedBrowser === undefined ? {} : { assistRejectedBrowser }),
+        }),
+        { client: clientWith(vi.fn(async () => modeWin.frame)), now: () => 1_000 },
+      )
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      if (expectActive) {
+        await vi.waitFor(() => expect(modeWin.clicks).toHaveLength(1))
+        expect(modeWin.addStyleTag).toHaveBeenCalledTimes(1)
+      } else {
+        expect(modeWin.addStyleTag).not.toHaveBeenCalled()
+        expect(modeWin.clicks).toHaveLength(0)
+      }
+      modeWin.page.avatarCount = 1
+      expect(await modeRun).toEqual({ status: 'authed', backend })
+    }
 
-    const turnedOff = fakeGoogleWindow('cloud')
-    turnedOff.page.visible.clear()
-    turnedOff.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
-    turnedOff.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.retry)
-    const turnedOffRun = openAuthWindow(
-      createGoogleAuthAdapter({ pollMs: 1, assistRejectedBrowser: 'off' }),
-      { client: clientWith(vi.fn(async () => turnedOff.frame)) },
+    // Retry caps 0, -1, NaN, and Infinity disable rejected-browser hiding and retries; 1.5 floors to 1 retry.
+    for (const badCap of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const capWin = fakeGoogleWindow('cloud')
+      capWin.goto.mockImplementation(async () => {
+        capWin.emitDocument('https://accounts.google.com')
+      })
+      capWin.page.visible.clear()
+      capWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
+      capWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.retry)
+      const capRun = openAuthWindow(
+        createGoogleAuthAdapter({ pollMs: 1, maxRejectedBrowserRetries: badCap }),
+        { client: clientWith(vi.fn(async () => capWin.frame)) },
+      )
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(capWin.addStyleTag).not.toHaveBeenCalled()
+      expect(capWin.clicks).toHaveLength(0)
+      capWin.page.avatarCount = 1
+      expect(await capRun).toEqual({ status: 'authed', backend: 'cloud' })
+    }
+
+    const flooredWin = fakeGoogleWindow('cloud')
+    let flooredClock = 1_000
+    flooredWin.goto.mockImplementation(async () => {
+      flooredWin.emitDocument('https://accounts.google.com')
+    })
+    flooredWin.page.visible.clear()
+    flooredWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
+    flooredWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.retry)
+    const flooredRun = openAuthWindow(
+      createGoogleAuthAdapter({ pollMs: 1, stepCooldownMs: 50, maxRejectedBrowserRetries: 1.5 }),
+      { client: clientWith(vi.fn(async () => flooredWin.frame)), now: () => flooredClock },
     )
-    turnedOff.emitDocument('https://accounts.google.com')
-    await new Promise((resolve) => setTimeout(resolve, 20))
-    expect(turnedOff.addStyleTag).not.toHaveBeenCalled()
-    expect(turnedOff.clicks).toHaveLength(0)
-    turnedOff.page.avatarCount = 1
-    expect(await turnedOffRun).toEqual({ status: 'authed', backend: 'cloud' })
+    await vi.waitFor(() => expect(flooredWin.clicks).toHaveLength(1))
+    flooredClock += 100
+    await vi.waitFor(() => expect(flooredWin.styles.at(-1)?.content).toBe(GOOGLE_REJECTED_BROWSER_SELECTORS.revealCss))
+    expect(flooredWin.clicks).toHaveLength(1)
+    flooredWin.page.avatarCount = 1
+    expect(await flooredRun).toEqual({ status: 'authed', backend: 'cloud' })
 
     // Custom marker + retry derive matching hideCss/revealCss; explicit '' override disables CSS.
     const custom = fakeGoogleWindow('cloud')
@@ -513,10 +562,12 @@ describe('Google auth adapter', () => {
 
     // Explicit empty hideCss / revealCss disables CSS injection while keeping retries active.
     const blankCss = fakeGoogleWindow('cloud')
+    blankCss.goto.mockImplementation(async () => {
+      blankCss.emitDocument('https://accounts.google.com')
+    })
     blankCss.page.visible.clear()
     blankCss.page.visible.add('a.help-custom')
     blankCss.page.visible.add('a.retry-custom')
-    blankCss.emitDocument('https://accounts.google.com')
     const blankCssRun = openAuthWindow(
       createGoogleAuthAdapter({
         pollMs: 1,
@@ -534,7 +585,7 @@ describe('Google auth adapter', () => {
     expect(await blankCssRun).toEqual({ status: 'authed', backend: 'cloud' })
   })
 
-  it('probes count before strict isVisible and recovers from transient TimeoutError on disappeared elements', async () => {
+  it('probes count before strict isVisible, survives TimeoutError in the same tick, and propagates fatal errors', async () => {
     const strictWin = fakeGoogleWindow({ backend: 'cloud', strictIsVisible: true })
     strictWin.page.visible.clear()
     strictWin.goto.mockImplementation(async () => {
@@ -542,6 +593,7 @@ describe('Google auth adapter', () => {
     })
     const adapter = createGoogleAuthAdapter({
       pollMs: 1,
+      stepCooldownMs: 50,
       selectors: {
         passkeyPrompt: '.passkey-prompt',
         selectionList: '.challenge-selection',
@@ -550,18 +602,45 @@ describe('Google auth adapter', () => {
     })
     const run = openAuthWindow(adapter, {
       client: clientWith(vi.fn(async () => strictWin.frame)),
+      now: () => 1_000,
     })
 
-    // Several ticks on a clean identifier screen must settle immediately via count() without invoking strict isVisible().
+    // Clean identifier screen must settle via count() without invoking strict isVisible().
     await new Promise((resolve) => setTimeout(resolve, 25))
     expect(strictWin.isVisibleCalls).toEqual([])
 
-    // Race where marker count() was 1 but disappears with TimeoutError during isVisible().
+    // Persistent TimeoutError on marker.isVisible() must resolve false so passkey fallback still clicks in the same tick.
+    strictWin.timeoutSelectors.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
     strictWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
-    strictWin.failNextIsVisibleTimeout()
-    await vi.waitFor(() => expect(strictWin.isVisibleCalls).toContain(GOOGLE_REJECTED_BROWSER_SELECTORS.marker))
+    strictWin.page.visible.add('.passkey-prompt')
+    strictWin.page.visible.add('button.try-another')
+    await vi.waitFor(() => expect(strictWin.clicks).toEqual([{
+      selector: 'button.try-another',
+      reason: DEFAULT_GOOGLE_INTERACTION_REASON,
+    }]))
 
     strictWin.page.avatarCount = 1
     expect(await run).toEqual({ status: 'authed', backend: 'cloud' })
+
+    // Fatal locator errors in isLocatorVisible and in onTick's fallback addStyleTag fail the window immediately.
+    const fatalLocatorErr = Object.assign(new Error('invalid selector'), { name: LOCATOR_INVALID })
+    const fatalLocatorWin = fakeGoogleWindow('cloud')
+    fatalLocatorWin.page.visible.clear()
+    fatalLocatorWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
+    fatalLocatorWin.fatalErrorSelectors.set(GOOGLE_REJECTED_BROWSER_SELECTORS.marker, fatalLocatorErr)
+    expect(await openAuthWindow(youtubeAuthAdapter({ pollMs: 1 }), {
+      client: clientWith(vi.fn(async () => fatalLocatorWin.frame)),
+    })).toEqual({ status: 'failed', backend: 'cloud', error: fatalLocatorErr })
+
+    const fatalStyleErr = Object.assign(new Error('invalid style'), { name: LOCATOR_INVALID })
+    const fatalStyleWin = fakeGoogleWindow('cloud')
+    fatalStyleWin.page.visible.clear()
+    fatalStyleWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.marker)
+    fatalStyleWin.page.visible.add(GOOGLE_REJECTED_BROWSER_SELECTORS.retry)
+    fatalStyleWin.addStyleTag.mockRejectedValueOnce(fatalStyleErr)
+    expect(await openAuthWindow(youtubeAuthAdapter({ pollMs: 1 }), {
+      client: clientWith(vi.fn(async () => fatalStyleWin.frame)),
+    })).toEqual({ status: 'failed', backend: 'cloud', error: fatalStyleErr })
+    expect(fatalStyleWin.clicks).toHaveLength(0)
   })
 })

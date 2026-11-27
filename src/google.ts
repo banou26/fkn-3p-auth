@@ -23,7 +23,10 @@ export type GooglePasskeySelectors = {
   passkeyChoiceCss: string
 }
 
-/** DOM selectors and severity-0 CSS used to hide and recover from Google's rejected-browser screen. */
+/**
+ * DOM selectors and severity-0 CSS used to hide and recover from Google's rejected-browser screen.
+ * Override `hideCss` and `revealCss` together so the reveal fallback undoes custom hide rules.
+ */
 export type GoogleRejectedBrowserSelectors = {
   marker: string
   retry: string
@@ -104,6 +107,11 @@ const isAssistEnabled = (
   ctx: AuthStepContext,
 ): boolean => mode === 'always' || (mode === 'cloud-only' && ctx.backend !== 'extension')
 
+const normalizeRetryCap = (value: number | undefined, fallback: number): number => {
+  if (value === undefined) return fallback
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+}
+
 // `@fkn/lib`'s `isVisible()` retries to the deadline when zero elements match; probing `count()` first avoids stalling `onTick`.
 const isLocatorVisible = async (frame: WindowFrame, selector: string): Promise<boolean> => {
   if (!selector) return false
@@ -142,9 +150,12 @@ export const createGoogleAuthAdapter = <TSession = void>(
   const assistPasskey = options.assistPasskey ?? 'cloud-only'
   const hidePasskeyChoices = options.hidePasskeyChoices ?? true
   const maxTryAnotherWayClicks = options.maxTryAnotherWayClicks ?? DEFAULT_MAX_TRY_ANOTHER_WAY_CLICKS
-  const assistRejectedBrowser = options.assistRejectedBrowser ?? 'always'
+  const assistRejectedBrowser = options.assistRejectedBrowser ?? 'cloud-only'
   const hideRejectedBrowser = options.hideRejectedBrowser ?? true
-  const maxRejectedBrowserRetries = options.maxRejectedBrowserRetries ?? DEFAULT_MAX_REJECTED_BROWSER_RETRIES
+  const maxRejectedBrowserRetries = normalizeRetryCap(
+    options.maxRejectedBrowserRetries,
+    DEFAULT_MAX_REJECTED_BROWSER_RETRIES,
+  )
   const stepCooldownMs = options.stepCooldownMs ?? DEFAULT_STEP_COOLDOWN_MS
   const selectors: GooglePasskeySelectors = {
     ...GOOGLE_PASSKEY_SELECTORS,
@@ -234,13 +245,15 @@ export const createGoogleAuthAdapter = <TSession = void>(
               hiddenDocGen.set(ctx.frame, gen)
               try {
                 await ctx.frame.addStyleTag({ content: rejectedHideCss })
-              } catch {
+              } catch (error) {
                 if (hiddenDocGen.get(ctx.frame) === gen) hiddenDocGen.delete(ctx.frame)
+                throw error
               }
             }
             await ctx.cooldown('google-rejected-browser-retry', stepCooldownMs, async () => {
               const current = rejectedBrowserClicks.get(ctx.frame) ?? 0
               if (current >= maxRejectedBrowserRetries) return
+              // Count before clicking so a navigation triggered mid-click still consumes the attempt safely.
               rejectedBrowserClicks.set(ctx.frame, current + 1)
               await ctx.frame.locator(rejectedSelectors.retry).first().click({ reason: interactionReason })
             })
