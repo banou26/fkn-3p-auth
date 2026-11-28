@@ -1,6 +1,6 @@
 {
   "name": "@banou/fkn-3p-auth",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shared third-party window auth, cloud sign-out, hidden session probes, cross-tab sync, and Google sign-in helpers on @fkn/lib.",
   "license": "MIT",
   "type": "module",
